@@ -9,8 +9,8 @@
  * of every setting.
  *
  * Detection pipeline, in order:
- *  - Brightness / Max Black % gates -- skip analysis on frames too dark or
- *    too uniformly black to give a trustworthy reading (loading screens,
+ *  - Max Darkness % gate -- skip analysis on frames too dark or too
+ *    uniformly black to give a trustworthy reading (loading screens,
  *    boot logos, fades).
  *  - Per-row/column content scan -- a row or column only counts as
  *    "content" once a meaningful fraction of its pixels exceed Black
@@ -32,15 +32,11 @@
  * Commit pipeline: every successful detection becomes a "pending
  * candidate" that needs Debounce consecutive matching passes before being
  * committed as the active crop (filtering out a single bad/transitional
- * frame, or a one-off noisy reading on a borderline edge). Two things
- * bypass debounce outright and commit a single reading unconditionally:
- *  - The very first detection ever (after creation or a resolution
- *    change) -- there's no prior crop to protect by waiting.
- *  - A stall-timeout safety valve (COMMIT_STALL_TIMEOUT_SECS) if real
- *    seconds since the last commit exceed it despite repeated valid
- *    attempts -- a true last resort, not the common path.
+ * frame, or a one-off noisy reading on a borderline edge). The first
+ * detection ever (after creation or a resolution change) commits
+ * immediately -- there is no prior crop to protect by waiting.
  *
- * Everything else -- a settings change, the Recalculate Crop Now button,
+ * Everything else -- a settings change, the Force Crop Now button,
  * or the first reading after a dark/black-gated gap -- still goes through
  * genuine debounce confirmation, just FAST: fast_recheck re-triggers
  * analysis every FAST_RECHECK_INTERVAL_SECS instead of waiting for the
@@ -58,6 +54,11 @@
 
 #include <obs-module.h>
 #include <util/platform.h>
+#ifdef _WIN32
+#  include <util/threading-windows.h>
+#else
+#  include <util/threading-posix.h>
+#endif
 #include <graphics/graphics.h>
 #include <math.h>
 #include <string.h>
@@ -82,15 +83,22 @@ MODULE_EXPORT const char *obs_module_description(void)
 #define S_TRIM_Y        "trim_y_pct"
 #define S_BLACK_THRESH  "black_threshold"
 #define S_RECALC_SECS   "recalc_interval"
-#define S_MIN_BRIGHT    "min_brightness"
-#define S_MAX_BLACK_PCT "max_black_percent"
+#define S_MAX_DARKNESS  "max_darkness"
+#define S_DEFAULT_CROP  "default_crop"
+#define S_EDGE_SAMPLE_Y "edge_sample_y"
+#define S_EDGE_SAMPLE_X "edge_sample_x"
 #define S_DEBOUNCE      "debounce_count"
 #define S_FREEZE_CROP   "freeze_crop"
 #define S_RECALC_BUTTON "recalc_now_button"
-#define S_LIMIT_SMALL_CHANGES "limit_small_changes"
-#define S_MIN_CHANGE_PCT      "min_change_pct"
+#define S_LIMIT_SMALL_CHANGES "skip_minor_updates"
+#define S_MIN_CHANGE_PCT      "min_update_size"
 #define S_MAX_CROP_X    "max_crop_x"
 #define S_MAX_CROP_Y    "max_crop_y"
+
+/* Default crop modes */
+#define DEFAULT_CROP_NONE  0   /* full frame, let detection decide */
+#define DEFAULT_CROP_4_3   1   /* 4:3 center crop (removes pillarbox on 16:9) */
+#define DEFAULT_CROP_16_9  2   /* 16:9 center crop (removes letterbox on 4:3) */
 
 /* Scale filter modes -- must match the dropdown order in filter_properties()
  * and the branch order in the pixel shader. */
@@ -121,28 +129,8 @@ MODULE_EXPORT const char *obs_module_description(void)
  * the larger GPU readback (~3.5 MB versus well under 1 MB before) is a
  * reasonable trade for the precision gained.
  * ============================================================================= */
-#define ANA_W 1280
-#define ANA_H 720
-
-/* If the committed crop hasn't updated in this many real seconds despite
- * repeated valid analysis attempts, the next attempt commits immediately
- * regardless of debounce matching. See secs_since_commit for why this
- * exists -- normal debounce has no time-based escape, so without this a
- * source with sustained drift or consistently-above-tolerance noise
- * between passes could leave the crop stuck on a stale value
- * indefinitely. Deliberately a flat constant rather than scaled from
- * Recalc Interval / Debounce -- "no update in 15 real seconds" is
- * unreasonable regardless of how those are configured. */
-#define COMMIT_STALL_TIMEOUT_SECS 15.0f
-
-/* Fixed per-pixel "is this black" cutoff used ONLY by the Max Black %
- * frame-level gate -- deliberately independent of the user's Black
- * Threshold setting (which tunes the border row/column scan instead).
- * Keeping these separate means raising Black Threshold for border
- * tuning never affects how readily Max Black % gates a frame. 16/255 is
- * a conservative "genuinely black" default that won't misclassify
- * normal dim/mid-tone gameplay. */
-#define BLACK_PCT_GATE_THRESH 16
+#define ANA_W 640
+#define ANA_H 360
 
 /* How long a new live resolution (when Output Width/Height = 0, auto) must
  * hold steady before being adopted as the reported/rendered output size.
@@ -154,8 +142,7 @@ MODULE_EXPORT const char *obs_module_description(void)
  * active. Without a cap, a source whose detected boundary doesn't settle
  * within 2 consecutive readings (not unusual -- that's the whole reason
  * debounce exists) would trigger a full GPU analysis pass (texrender +
- * a GPU->CPU readback + a 480x360 pixel scan) on every rendered frame,
- * for up to the full stall-timeout window, every time a setting changes
+ * a GPU->CPU readback + a 640x360 pixel scan) on every rendered frame,
  * -- enough sustained load to make the rest of OBS feel sluggish. 100ms
  * keeps fast_recheck's responsiveness (imperceptible to a human
  * adjusting a slider) without hammering at full render framerate. */
@@ -399,13 +386,14 @@ struct dynamic_autocrop_filter {
     float    trim_x;          /* Horizontal Trim %, as a fraction (0.01=1%) */
     float    trim_y;          /* Vertical Trim %, as a fraction (0.01=1%)   */
     int      black_thresh;    /* max(r,g,b) < thresh -> treated as black */
-    float    recalc_secs;     /* seconds between analyses              */
-    float    min_brightness;  /* 0-1 avg-luma gate; skip darker frames */
-    float    max_black_pct;   /* 0-1 fraction of frame; skip if more of
-                                * the frame than this is near-black, even
-                                * if average luma alone wouldn't catch it
-                                * (e.g. dark stealth scenes with a small
-                                * bright HUD pulling the average up)     */
+    float    scan_interval;     /* seconds between analyses              */
+    float    max_darkness;    /* 0-1: gate fires when zone luma < this     */
+    float    edge_sample_y;   /* 0-1: how far in from top/bottom to scan   */
+    float    edge_sample_x;   /* 0-1: how far in from left/right to scan   */
+    int      default_crop;      /* DEFAULT_CROP_NONE/4_3/16_9               */
+    volatile bool force_crop;          /* true: bypass gates and commit immediately (UI->video thread) */
+    volatile bool needs_analysis;      /* true: run analysis this render frame  (UI->video thread)   */
+    volatile bool fast_recheck;        /* true: use fast interval               (UI->video thread)   */
     int      debounce_needed; /* stable consecutive samples to commit  */
     bool     freeze_crop;     /* true = stop periodic re-analysis, hold
                                 * whatever crop is currently committed   */
@@ -420,7 +408,7 @@ struct dynamic_autocrop_filter {
      * compared against the CURRENTLY COMMITTED raw boundary too (not
      * just against itself across consecutive readings, which is what
      * debounce alone already does) -- if the difference is below
-     * min_change_pct on every edge, the candidate is discarded and the
+     * min_update_size on every edge, the candidate is discarded and the
      * existing committed crop is kept exactly as-is. Debounce protects
      * against trusting a single noisy reading; it does NOT protect
      * against the noise floor itself drifting -- two consecutive
@@ -428,8 +416,8 @@ struct dynamic_autocrop_filter {
      * that's still only noise relative to what's already committed,
      * and debounce alone has no way to tell the difference. This adds
      * that second comparison specifically. */
-    bool     limit_small_changes;
-    float    min_change_pct;  /* 0-1 fraction; differences below this on
+    bool     skip_minor_updates;
+    float    min_update_size;  /* 0-1 fraction; differences below this on
                                 * every edge are treated as noise        */
 
     /* -- Committed RAW detected boundary (normalised UV 0-1) --
@@ -442,25 +430,25 @@ struct dynamic_autocrop_filter {
      * detected signal is stable is the part that actually needs multiple
      * agreeing samples; the post-processing math applied on top of it is
      * deterministic and doesn't need separate confirmation. */
-    float cx0, cy0;   /* top-left  */
-    float cx1, cy1;   /* bot-right */
+    float crop_x0, crop_y0;   /* top-left  */
+    float crop_x1, crop_y1;   /* bot-right */
 
     /* -- Pending RAW candidate (debounce buffer) -- */
-    float px0, py0;
-    float px1, py1;
-    int   stable_count;
+    float pending_x0, pending_y0;
+    float pending_x1, pending_y1;
+    int   debounce_count;
 
-    /* -- Has a crop ever been committed for the current resolution?
-     * The very first successful detection commits immediately
-     * (bypassing debounce) so the picture isn't stuck showing the
-     * uncropped border for several analysis cycles after startup or
-     * a resolution change. Subsequent updates still use debounce to
-     * avoid jitter. -- */
-    bool committed_once;
+    /* -- Is there a valid committed crop for this resolution? --
+     * False on filter create and after a resolution change. Set to true
+     * when the first debounce commit succeeds, or when Default Crop or
+     * Force Crop Now commits directly. Guards skip_minor_updates so it
+     * doesn't compare against uninitialised values before anything has
+     * ever been committed. */
+    bool crop_valid;
 
     /* -- Fast-recheck mode --
      * Set whenever the user explicitly changes a setting, presses
-     * Recalculate Crop Now, or the first valid reading arrives after
+     * Force Crop Now, or the first valid reading arrives after
      * one or more dark/black-gated skips. While true, filter_tick
      * re-triggers analysis every FAST_RECHECK_INTERVAL_SECS instead of
      * waiting for the normal Recalc Interval timer, so debounce's
@@ -469,30 +457,11 @@ struct dynamic_autocrop_filter {
      * without skipping debounce itself, which still genuinely requires
      * `debounce_needed` consecutive matching reads, just gathered
      * faster. */
-    bool  fast_recheck;
     float fast_recheck_elapsed; /* seconds since the last fast-recheck pass */
 
-    /* -- Stall-prevention safety valve --
-     * Normal debounce compares each new analysis result only against
-     * the PREVIOUS pending candidate, never against elapsed time. If
-     * the source has any sustained drift (not just random jitter) --
-     * or noise that happens to consistently exceed CROP_TOLERANCE
-     * between consecutive passes -- stable_count can keep resetting to
-     * 1 forever, with nothing ever confirming. There is no theoretical
-     * upper bound on how long the committed crop can then sit stale
-     * without normal debounce alone. This tracks real seconds since
-     * the last successful commit; if it grows past
-     * COMMIT_STALL_TIMEOUT_SECS despite repeated valid (non-skipped)
-     * analysis attempts, the next analysis commits unconditionally,
-     * regardless of whether it matches the pending candidate. This
-     * remains a true last-resort bypass (unlike fast_recheck above) --
-     * it only fires if even rapid-fire debounce couldn't agree for an
-     * unreasonably long stretch. */
-    float secs_since_commit;
-
     /* -- Tracked source dimensions (detect resolution changes) -- */
-    uint32_t prev_src_w;
-    uint32_t prev_src_h;
+    uint32_t last_src_w;
+    uint32_t last_src_h;
 
     /* -- Debounced stable output size (runtime only, never saved) --
      * Used only when Output Width/Height = 0 (auto). A new live
@@ -500,14 +469,13 @@ struct dynamic_autocrop_filter {
      * being adopted -- this filters out brief negotiation blips during
      * capture device startup/mode changes without permanently locking
      * onto a possibly-wrong value the way a one-time snapshot would. */
-    uint32_t stable_out_w, stable_out_h; /* currently adopted stable size */
+    uint32_t adopted_out_w, adopted_out_h; /* currently adopted stable size */
     uint32_t candidate_w, candidate_h;   /* most recent live reading      */
-    float    settle_timer;               /* seconds candidate has held    */
+    float    candidate_secs;               /* seconds candidate has held    */
 
     /* -- Timing / state flags -- */
     float elapsed;
-    bool  needs_analysis;
-    bool  first_run;
+    bool  needs_initial_scan;
 
     /* -- GPU resources -- */
     gs_texrender_t *texrender;  /* downscale render target (ANA_W x ANA_H) */
@@ -537,11 +505,44 @@ static inline float clampf(float v, float lo, float hi)
  * boundary by scanning from each edge inward.
  *
  * Returns false when:
- *   - The average luma is below min_brightness (dark / fade-to-black).
+ *   - The average luma of non-pure-black pixels is below max_darkness (dark / fade-to-black).
  *   - The detected content region is implausibly small (< 10 % per axis).
  * ============================================================================= */
+/* Returns true if the pixel zone [x0,x1) x [y0,y1) passes the darkness gate.
+ *
+ * Pure-black pixels (max(r,g,b) <= 1) are excluded from the calculation --
+ * RetroTink hardware borders are pure black and would otherwise dominate the
+ * zone luma, causing the gate to fire on valid content frames that simply
+ * have wide borders.
+ *
+ * The gate fires when the average luma of all remaining (non-pure-black)
+ * pixels falls below max_darkness. A zone that is entirely pure-black (e.g.
+ * a genuine black loading screen with no content at all) is always gated. */
+static bool zone_passes_gates(const uint8_t *data, uint32_t linesize,
+                               uint32_t x0, uint32_t y0,
+                               uint32_t x1, uint32_t y1,
+                               float max_darkness)
+{
+    double   luma_sum = 0.0;
+    uint32_t total    = 0;
+
+    for (uint32_t y = y0; y < y1; y++) {
+        const uint8_t *row = data + y * linesize;
+        for (uint32_t x = x0; x < x1; x++) {
+            uint8_t b = row[x*4+0], g = row[x*4+1], r = row[x*4+2];
+            uint8_t m = b > g ? b : g; if (r > m) m = r;
+            if (m <= 1) continue;  /* skip pure black / 0x010101 */
+            luma_sum += 0.114*b + 0.587*g + 0.299*r;
+            total++;
+        }
+    }
+
+    if (total == 0) return false;
+    double luma = luma_sum / ((double)total * 255.0);
+    return luma >= (double)max_darkness;
+}
+
 static bool analyse_frame(struct dynamic_autocrop_filter *f,
-                           uint32_t src_w, uint32_t src_h,
                            float *out_x0, float *out_y0,
                            float *out_x1, float *out_y1)
 {
@@ -555,92 +556,21 @@ static bool analyse_frame(struct dynamic_autocrop_filter *f,
     const uint32_t H = ANA_H;
     const int      T = f->black_thresh;
 
-    /* -- Brightness gate + black-pixel-coverage gate --
-     * OBS stage surfaces in BGRA layout:
-     *   byte 0 = B, 1 = G, 2 = R, 3 = A
-     * BT.601 luma = 0.299 R + 0.587 G + 0.114 B
+    /* -- Per-edge perimeter scan with brightness gating --
      *
-     * Both metrics are computed in a single pass:
-     *   - avg_luma:   mean brightness across the whole frame. Catches
-     *                 uniformly dark frames (fades, loading screens).
-     *   - black_frac: fraction of PIXELS that are individually below
-     *                 BLACK_PCT_GATE_THRESH (a fixed constant, NOT the
-     *                 user's Black Threshold -- see below for why).
-     *                 Catches scenes that are mostly black but contain
-     *                 a small bright element (HUD, muzzle flash, a
-     *                 flashlight cone) that pulls the average luma up
-     *                 enough to slip past that gate alone.
+     * Each edge has its own sampling zone:
+     *   Top / Bottom  : edge_sample_y * H rows from the respective edge
+     *   Left / Right  : edge_sample_x * W cols from the respective edge
      *
-     * black_frac deliberately does NOT reuse the user's Black Threshold
-     * (T) the way the border row/column scan does. Those are two
-     * different concepts that happen to look similar: Black Threshold
-     * tunes "how dark must a pixel be to count as scaler BORDER", while
-     * this gate asks "is the FRAME overall too dark to trust an
-     * analysis on at all". Sharing one value meant raising Black
-     * Threshold for legitimate border-detection tuning could also
-     * silently make this gate misclassify genuine mid-tone gameplay as
-     * "black", pushing black_frac over Max Black % and freezing
-     * analysis entirely -- with no way to tell from the Black Threshold
-     * tooltip alone that the two were connected. */
-    double  luma_sum         = 0.0;
-    uint64_t black_pixel_count = 0;
-    for (uint32_t y = 0; y < H; y++) {
-        const uint8_t *row = data + y * linesize;
-        for (uint32_t x = 0; x < W; x++) {
-            uint8_t b = row[x * 4 + 0];
-            uint8_t g = row[x * 4 + 1];
-            uint8_t r = row[x * 4 + 2];
+     * All four zones are checked against max_darkness. If ANY zone fails,
+     * the entire analysis is held -- no partial updates. All zones must
+     * pass for detection to proceed. */
 
-            luma_sum += 0.114 * b + 0.587 * g + 0.299 * r;
-
-            uint8_t maxc = b;
-            if (g > maxc) maxc = g;
-            if (r > maxc) maxc = r;
-            if (maxc <= (uint8_t)BLACK_PCT_GATE_THRESH)
-                black_pixel_count++;
-        }
-    }
-    double avg_luma   = luma_sum / ((double)W * H * 255.0);
-    double black_frac = (double)black_pixel_count / ((double)W * H);
-
-    if (avg_luma < (double)f->min_brightness) {
-        gs_stagesurface_unmap(f->stagesurf);
-        blog(LOG_INFO,
-             "[dynamic-autocrop] Frame too dark (luma=%.3f < %.3f), skipping",
-             avg_luma, (double)f->min_brightness);
-        return false;
-    }
-
-    if (black_frac > (double)f->max_black_pct) {
-        gs_stagesurface_unmap(f->stagesurf);
-        blog(LOG_INFO,
-             "[dynamic-autocrop] Frame too black (%.1f%% black > %.1f%% limit), skipping",
-             black_frac * 100.0, (double)f->max_black_pct * 100.0);
-        return false;
-    }
-
-    /* -- Content / border pixel test --
-     * A pixel is "content" if any of its R, G, B channels exceeds the
-     * black threshold. This naturally handles:
-     *   - Pure-black borders
-     *   - Slightly grey or noisy analog-capture borders
-     *   - The composite/S-Video noise floor
-     */
 #define IS_CONTENT(row, x) \
     ((row)[(x) * 4 + 0] > (uint8_t)T || \
      (row)[(x) * 4 + 1] > (uint8_t)T || \
      (row)[(x) * 4 + 2] > (uint8_t)T)
 
-    /* A row/column only counts as "content" once at least this fraction of
-     * its pixels exceed the black threshold (floor of 2 pixels minimum).
-     * Without this, a SINGLE noisy/hot pixel anywhere in a border row --
-     * an analog noise spike, a compression artifact, a stray bright dot --
-     * is enough to make the whole row register as content and stop the
-     * scan immediately, leaving every genuinely-black row above/below it
-     * still inside the committed crop. Requiring a minimum spread of
-     * bright pixels means real picture content (which lights up many
-     * pixels across the row) still triggers normally, while isolated
-     * noise in the border does not. */
 #define MIN_CONTENT_FRACTION 0.02f
 
     uint32_t min_count_w = (uint32_t)((float)W * MIN_CONTENT_FRACTION);
@@ -648,9 +578,41 @@ static bool analyse_frame(struct dynamic_autocrop_filter *f,
     uint32_t min_count_h = (uint32_t)((float)H * MIN_CONTENT_FRACTION);
     if (min_count_h < 2) min_count_h = 2;
 
+    uint32_t zone_y = (uint32_t)(f->edge_sample_y * (float)H);
+    uint32_t zone_x = (uint32_t)(f->edge_sample_x * (float)W);
+    if (zone_y < 1) zone_y = 1;
+    if (zone_y > H) zone_y = H;
+    if (zone_x < 1) zone_x = 1;
+    if (zone_x > W) zone_x = W;
+
+    /* Gate each zone independently */
+    bool top_ok = zone_passes_gates(data, linesize,
+                                    0, 0, W, zone_y,
+                                    f->max_darkness);
+    bool bot_ok = zone_passes_gates(data, linesize,
+                                    0, H - zone_y, W, H,
+                                    f->max_darkness);
+    bool lft_ok = zone_passes_gates(data, linesize,
+                                    0, 0, zone_x, H,
+                                    f->max_darkness);
+    bool rgt_ok = zone_passes_gates(data, linesize,
+                                    W - zone_x, 0, W, H,
+                                    f->max_darkness);
+
+    /* All four zones must pass for normal analysis.
+     * If force_crop is set, bypass gate checks entirely regardless of
+     * zone state -- the flag is left for do_analysis to consume and
+     * commit immediately without debounce. */
+    if (f->force_crop) {
+        /* Gate bypass -- scan anyway, do_analysis will commit */
+    } else if (!top_ok || !bot_ok || !lft_ok || !rgt_ok) {
+        gs_stagesurface_unmap(f->stagesurf);
+        return false;
+    }
+
     /* Top edge */
-    uint32_t top = 0;
-    for (uint32_t y = 0; y < H; y++) {
+    uint32_t top = zone_y;
+    for (uint32_t y = 0; y < zone_y; y++) {
         const uint8_t *row = data + y * linesize;
         uint32_t count = 0;
         for (uint32_t x = 0; x < W; x++)
@@ -659,18 +621,19 @@ static bool analyse_frame(struct dynamic_autocrop_filter *f,
     }
 
     /* Bottom edge */
-    uint32_t bot = H > 0 ? H - 1 : 0;
-    for (int32_t y = (int32_t)H - 1; y >= 0; y--) {
+    uint32_t bot = H - 1 - zone_y;
+    for (uint32_t i = 0; i < zone_y; i++) {
+        uint32_t y = H - 1 - i;
         const uint8_t *row = data + y * linesize;
         uint32_t count = 0;
         for (uint32_t x = 0; x < W; x++)
             if (IS_CONTENT(row, x)) count++;
-        if (count >= min_count_w) { bot = (uint32_t)y; break; }
+        if (count >= min_count_w) { bot = y; break; }
     }
 
     /* Left edge */
-    uint32_t lft = 0;
-    for (uint32_t x = 0; x < W; x++) {
+    uint32_t lft = zone_x;
+    for (uint32_t x = 0; x < zone_x; x++) {
         uint32_t count = 0;
         for (uint32_t y = 0; y < H; y++) {
             const uint8_t *row = data + y * linesize;
@@ -680,14 +643,15 @@ static bool analyse_frame(struct dynamic_autocrop_filter *f,
     }
 
     /* Right edge */
-    uint32_t rgt = W > 0 ? W - 1 : 0;
-    for (int32_t x = (int32_t)W - 1; x >= 0; x--) {
+    uint32_t rgt = W - 1 - zone_x;
+    for (uint32_t i = 0; i < zone_x; i++) {
+        uint32_t x = W - 1 - i;
         uint32_t count = 0;
         for (uint32_t y = 0; y < H; y++) {
             const uint8_t *row = data + y * linesize;
             if (IS_CONTENT(row, x)) count++;
         }
-        if (count >= min_count_h) { rgt = (uint32_t)x; break; }
+        if (count >= min_count_h) { rgt = x; break; }
     }
 
 #undef IS_CONTENT
@@ -695,49 +659,17 @@ static bool analyse_frame(struct dynamic_autocrop_filter *f,
 
     gs_stagesurface_unmap(f->stagesurf);
 
-    /* Convert pixel coords -> normalised UV. These are the RAW detected
-     * boundary -- Horizontal/Vertical Trim and Max Crop X/Y are
-     * deliberately NOT applied here. See apply_crop_postprocessing() and
-     * its call site in filter_render for why: those are pure functions
-     * of the CURRENT settings and should always reflect the latest
-     * values instantly, with no dependency on whether a fresh detection
-     * happened to run this frame. Baking them in here would tie them to
-     * this function's own gating (Min Brightness / Max Black %) and
-     * rate-limiting (Recalc Interval / fast_recheck) for no reason --
-     * changing Horizontal/Vertical Trim or Max Crop X/Y doesn't need a new
-     * detection at all, just a recompute from whatever raw boundary was
-     * last found, which is exactly what moving them out of here enables.
-     */
     float x0 = (float)lft        / (float)W;
     float y0 = (float)top        / (float)H;
     float x1 = (float)(rgt + 1)  / (float)W;
     float y1 = (float)(bot + 1)  / (float)H;
 
-    /* Sanity check: content must cover at least 2 % in each axis. This
-     * only needs to catch truly degenerate results (a near-zero-size
-     * detection from some analysis glitch) -- it is NOT meant to
-     * second-guess a legitimately small-but-real detection. Keep this
-     * threshold low: at higher Black Threshold values, genuine (if dim)
-     * gameplay can start failing the per-pixel brightness test too, not
-     * just the actual border, shrinking the detected region -- a higher
-     * threshold here would reject those passes outright, silently
-     * freezing the crop with no obvious cause. */
     if ((x1 - x0) < 0.02f || (y1 - y0) < 0.02f) {
-        blog(LOG_WARNING,
-             "[dynamic-autocrop] Detected region too small (%.3f x %.3f), skipping -- "
-             "if this repeats, Black Threshold may be set too high for this source",
-             x1 - x0, y1 - y0);
         return false;
     }
 
-    blog(LOG_INFO,
-         "[dynamic-autocrop] Raw border detected: (%.4f,%.4f)-(%.4f,%.4f)",
-         x0, y0, x1, y1);
-
-    *out_x0 = x0;
-    *out_y0 = y0;
-    *out_x1 = x1;
-    *out_y1 = y1;
+    *out_x0 = x0;  *out_y0 = y0;
+    *out_x1 = x1;  *out_y1 = y1;
     return true;
 }
 
@@ -747,15 +679,14 @@ static bool analyse_frame(struct dynamic_autocrop_filter *f,
  * Pure function: takes a raw detected boundary plus the filter's CURRENT
  * settings and produces the final crop to actually render. Deliberately
  * has no dependency on whether a fresh detection happened recently, no
- * gating, no rate-limiting, and no side effects (besides the optional
- * diagnostic log) -- it's meant to be cheap enough to call on every
- * single rendered frame, so that Horizontal/Vertical Trim and Max Crop X/Y always
+ * gating, no rate-limiting, and no side effects -- it's meant to be
+ * cheap enough to call on every single rendered frame, so that Horizontal/Vertical Trim and Max Crop X/Y always
  * reflect the latest value instantly, the moment they're changed,
  * completely independent of the (rate-limited, gated) detection pipeline
  * that produces the raw boundary it works from. This is what Max Crop
  * X/Y already needed fixed once before (a settings change had no visible
- * effect until detection happened to succeed again, which Min Brightness
- * / Max Black % could block indefinitely) -- Horizontal/Vertical Trim had exactly
+ * effect until detection happened to succeed again, which Max Darkness %
+ * gating could block indefinitely) -- Horizontal/Vertical Trim had exactly
  * the same latent bug, just less obviously, since changing it usually
  * does still trigger a fast-tracked fresh detection most of the time,
  * masking the underlying issue except when gating got in the way.
@@ -764,7 +695,6 @@ static void apply_crop_postprocessing(struct dynamic_autocrop_filter *f,
                                        float raw_x0, float raw_y0,
                                        float raw_x1, float raw_y1,
                                        uint32_t src_w, uint32_t src_h,
-                                       bool do_log,
                                        float *out_x0, float *out_y0,
                                        float *out_x1, float *out_y1)
 {
@@ -790,8 +720,6 @@ static void apply_crop_postprocessing(struct dynamic_autocrop_filter *f,
 
     float raw_width  = x1 - x0;
     float raw_height = y1 - y0;
-    bool clamped_by_max_crop = false;
-
     /* When the clamp engages, it expands outward from wherever the
      * detected boundary already is, rather than forcing the result to
      * the exact frame middle (0.5). The split between the two sides is
@@ -813,16 +741,12 @@ static void apply_crop_postprocessing(struct dynamic_autocrop_filter *f,
         float deficit = (min_width - raw_width) * 0.5f;
         x0 = raw_x0 - deficit;
         x1 = raw_x1 + deficit;
-        clamped_by_max_crop = true;
     }
     if (raw_height < min_height) {
         float deficit = (min_height - raw_height) * 0.5f;
         y0 = raw_y0 - deficit;
         y1 = raw_y1 + deficit;
-        clamped_by_max_crop = true;
     }
-
-    float post_maxcrop_x0 = x0, post_maxcrop_y0 = y0, post_maxcrop_x1 = x1, post_maxcrop_y1 = y1; /* for diagnostics */
 
     /* -- Horizontal / Vertical Trim --
      * Shrinks the (Max-Crop-protected) crop window inward, independently
@@ -850,24 +774,6 @@ static void apply_crop_postprocessing(struct dynamic_autocrop_filter *f,
 
     /* Nothing after this point checks or limits the result -- Horizontal/Vertical
      * Trim is the final word, always. */
-
-    if (do_log) {
-        /* Rate-limited by the caller (only logged once per fresh raw
-         * detection, not every render frame) -- full before/after
-         * breakdown of every stage, so a reported "trim doesn't seem to
-         * apply" can be checked directly against real numbers instead
-         * of guessed at. */
-        blog(LOG_INFO,
-             "[dynamic-autocrop] postprocess: raw=(%.4f,%.4f)-(%.4f,%.4f) max-crop-clamped=%s "
-             "-> post-maxcrop=(%.4f,%.4f)-(%.4f,%.4f) trim_x=%.2f%% trim_y=%.2f%% "
-             "-> final=(%.4f,%.4f)-(%.4f,%.4f) [max_crop_x=%.2f%% max_crop_y=%.2f%%]",
-             raw_x0, raw_y0, raw_x1, raw_y1,
-             clamped_by_max_crop ? "YES" : "no",
-             post_maxcrop_x0, post_maxcrop_y0, post_maxcrop_x1, post_maxcrop_y1,
-             f->trim_x * 100.0f, f->trim_y * 100.0f,
-             clampf(x0, 0.f, 1.f), clampf(y0, 0.f, 1.f), clampf(x1, 0.f, 1.f), clampf(y1, 0.f, 1.f),
-             f->max_crop_x * 100.0f, f->max_crop_y * 100.0f);
-    }
 
     *out_x0 = clampf(x0, 0.f, 1.f);
     *out_y0 = clampf(y0, 0.f, 1.f);
@@ -899,6 +805,39 @@ static inline bool crops_match(float ax0, float ay0, float ax1, float ay1,
  *
  * Must be called from the graphics/render thread (no obs_enter_graphics).
  * ============================================================================= */
+
+/* Compute the default crop position based on the selected mode and source
+ * dimensions. Returns a centered crop that removes the expected bars:
+ *   4:3 mode on 16:9 source → pillarbox removal (crop left/right)
+ *   16:9 mode on 4:3 source → letterbox removal (crop top/bottom)
+ *   Any mode where source already matches → full frame
+ * This becomes the reset position whenever detection starts fresh. */
+static void get_default_crop(int mode, uint32_t src_w, uint32_t src_h,
+                              float *cx0, float *cy0,
+                              float *cx1, float *cy1)
+{
+    *cx0 = 0.f; *cy0 = 0.f; *cx1 = 1.f; *cy1 = 1.f;
+    if (mode == DEFAULT_CROP_NONE || src_w == 0 || src_h == 0) return;
+
+    if (mode == DEFAULT_CROP_4_3) {
+        /* Remove pillarbox: center a 4:3 region at full height */
+        float target_w = (float)src_h * (4.f / 3.f);
+        if (target_w < (float)src_w) {
+            float margin = (1.f - target_w / (float)src_w) * 0.5f;
+            *cx0 = margin; *cx1 = 1.f - margin;
+        }
+        /* If source is already 4:3 or narrower, leave full frame */
+    } else if (mode == DEFAULT_CROP_16_9) {
+        /* Remove letterbox: center a 16:9 region at full width */
+        float target_h = (float)src_w * (9.f / 16.f);
+        if (target_h < (float)src_h) {
+            float margin = (1.f - target_h / (float)src_h) * 0.5f;
+            *cy0 = margin; *cy1 = 1.f - margin;
+        }
+        /* If source is already 16:9 or wider, leave full frame */
+    }
+}
+
 static void do_analysis(struct dynamic_autocrop_filter *f,
                          obs_source_t *target,
                          uint32_t src_w, uint32_t src_h)
@@ -931,8 +870,13 @@ static void do_analysis(struct dynamic_autocrop_filter *f,
      * hardware automatically downscales with bilinear filtering.
      */
     gs_texrender_reset(f->texrender);
-    if (!gs_texrender_begin(f->texrender, ANA_W, ANA_H))
+    if (!gs_texrender_begin(f->texrender, ANA_W, ANA_H)) {
+        /* GPU resource temporarily unavailable -- back to normal cadence
+         * rather than spinning in fast_recheck mode on every tick. */
+        f->fast_recheck = false;
+        f->debounce_count = 0;
         return;
+    }
 
     struct vec4 clear_col;
     vec4_zero(&clear_col);
@@ -948,74 +892,54 @@ static void do_analysis(struct dynamic_autocrop_filter *f,
 
     /* -- Analyse -- */
     float nx0, ny0, nx1, ny1;
-    if (!analyse_frame(f, src_w, src_h, &nx0, &ny0, &nx1, &ny1)) {
-        /* Frame too dark or degenerate -- keep current crop, but
-         * fast-track debounce on the next valid reading: there's no
-         * recent valid baseline left to meaningfully compare against
-         * after an indeterminate gap, and the scene may have genuinely
-         * changed during it (a loading screen ending into real
-         * gameplay, for instance). */
-        f->fast_recheck         = true;
-        f->fast_recheck_elapsed = 0.f;
+    if (!analyse_frame(f, &nx0, &ny0, &nx1, &ny1)) {
+        /* Gates closed or frame degenerate -- back to normal 1s cadence
+         * and reset debounce. Fast recheck only runs while gates are
+         * actively open and debounce is in progress. */
+        f->fast_recheck  = false;
+        f->debounce_count  = 0;
         return;
     }
 
-    /* Diagnostic only -- shows what the CURRENT settings would produce
-     * for this freshly detected raw boundary. Naturally rate-limited by
-     * how often raw detection itself happens (not called every render
-     * frame), unlike the actual rendered crop, which recomputes this
-     * silently on every frame via apply_crop_postprocessing() in
-     * filter_render so Horizontal/Vertical Trim / Max Crop X/Y always reflect the
-     * latest setting instantly regardless of detection timing. */
-    {
-        float dbg_x0, dbg_y0, dbg_x1, dbg_y1;
-        apply_crop_postprocessing(f, nx0, ny0, nx1, ny1, src_w, src_h, true,
-                                   &dbg_x0, &dbg_y0, &dbg_x1, &dbg_y1);
+    /* Gates are open -- arm fast recheck so debounce confirmations
+     * happen at ~100ms intervals rather than waiting a full second
+     * between each reading. Turns off again once debounce completes. */
+    f->fast_recheck         = true;
+    f->fast_recheck_elapsed = 0.f;
+
+    /* Clamp the detected crop to the user's selected default crop.
+     * The default crop is the floor -- detection can only ever tighten
+     * it, never widen past it. This means a blue no-signal screen or
+     * blank frame that scans as full-frame simply returns the default
+     * crop rather than blowing past it to 0,0,1,1. */
+    if (f->default_crop != DEFAULT_CROP_NONE) {
+        float dc0, dy0, dc1, dy1;
+        get_default_crop(f->default_crop, src_w, src_h, &dc0, &dy0, &dc1, &dy1);
+        if (nx0 < dc0) nx0 = dc0;
+        if (ny0 < dy0) ny0 = dy0;
+        if (nx1 > dc1) nx1 = dc1;
+        if (ny1 > dy1) ny1 = dy1;
     }
 
     /* -- Commit logic --
-     * Only two things ever bypass debounce outright and commit a
-     * single reading unconditionally:
+     * Two things bypass debounce and commit immediately:
      *
-     *   1. The very first successful detection ever (after creation or
-     *      a resolution change) -- there's no prior crop to protect by
-     *      waiting, so showing SOMETHING immediately beats sitting on
-     *      the full uncropped frame for several cycles.
-     *   2. The stall-timeout safety valve, as an absolute last resort
-     *      (see secs_since_commit) -- only fires after real debounce
-     *      (even fast-tracked) has failed to agree for an unreasonably
-     *      long stretch.
-     *
-     * Everything else -- including settings changes, the Recalculate
-     * button, and the first reading after a dark/black gap -- goes
-     * through the SAME genuine debounce confirmation below as normal
-     * periodic analysis, just gathered faster via fast_recheck (see its
-     * own comment) so it resolves within a fraction of a second rather
-     * than a full Recalc Interval, without skipping the requirement for
-     * genuine agreement between independent readings.
-     */
-    bool stall_timeout = f->secs_since_commit >= COMMIT_STALL_TIMEOUT_SECS;
-
-    if (!f->committed_once || stall_timeout) {
-        f->cx0 = nx0; f->cy0 = ny0;
-        f->cx1 = nx1; f->cy1 = ny1;
-        f->px0 = nx0; f->py0 = ny0;
-        f->px1 = nx1; f->py1 = ny1;
-        f->stable_count      = 0;
-        f->committed_once    = true;
-        f->fast_recheck       = false;
-        f->secs_since_commit = 0.f;
-
-        if (stall_timeout) {
-            blog(LOG_WARNING,
-                 "[dynamic-autocrop] Crop forced through after %.1fs without an update (stall timeout) "
-                 "L=%.4f T=%.4f R=%.4f B=%.4f",
-                 COMMIT_STALL_TIMEOUT_SECS, f->cx0, f->cy0, f->cx1, f->cy1);
-        } else {
-            blog(LOG_INFO,
-                 "[dynamic-autocrop] Initial crop committed  L=%.4f T=%.4f R=%.4f B=%.4f",
-                 f->cx0, f->cy0, f->cx1, f->cy1);
-        }
+     *   1. Force Crop Now button -- user explicitly requested it.
+     *   2. (nothing else) -- first detection goes through normal debounce
+     *      like everything else. Default Crop already shows a sensible
+     *      position while debounce accumulates, so there is no reason to
+     *      rush the first commit. */    /* -- Force Crop Now bypass --
+     * If the button was pressed, skip all debounce and minor-update
+     * checks and commit immediately. Clear the flag after commit. */
+    if (f->force_crop) {
+        f->crop_x0 = nx0; f->crop_y0 = ny0;
+        f->crop_x1 = nx1; f->crop_y1 = ny1;
+        f->debounce_count   = 0;
+        f->fast_recheck   = false;
+        f->force_crop     = false;
+        f->crop_valid = true;
+        blog(LOG_INFO, "[dynamic-autocrop] Force crop committed  L=%.4f T=%.4f R=%.4f B=%.4f",
+             f->crop_x0, f->crop_y0, f->crop_x1, f->crop_y1);
         return;
     }
 
@@ -1024,13 +948,22 @@ static void do_analysis(struct dynamic_autocrop_filter *f,
      * `debounce_needed` consecutive analysis passes. This prevents a
      * single transitional frame (cut, wipe, flash, or a noisy one-off
      * reading) from snapping the crop to a bad value. fast_recheck
-     * (set in filter_tick / filter_update) just controls how quickly
-     * those consecutive passes are gathered -- it never weakens the
-     * agreement requirement itself.
-     */
+     * just controls how quickly those consecutive passes are gathered.
+     *
+     * Early exit: if the candidate is already too close to the committed
+     * crop to be worth committing, don't bother debouncing -- bail
+     * immediately and go back to 1s cadence. */
+    if (f->crop_valid && f->skip_minor_updates &&
+        crops_match(nx0, ny0, nx1, ny1,
+                    f->crop_x0, f->crop_y0, f->crop_x1, f->crop_y1, f->min_update_size)) {
+        f->debounce_count  = 0;
+        f->fast_recheck  = false;
+        return;
+    }
+
     if (crops_match(nx0, ny0, nx1, ny1,
-                    f->px0, f->py0, f->px1, f->py1, CROP_TOLERANCE)) {
-        f->stable_count++;
+                    f->pending_x0, f->pending_y0, f->pending_x1, f->pending_y1, CROP_TOLERANCE)) {
+        f->debounce_count++;
         /* Still track the LATEST reading even on a match, not just the
          * first-in-streak value. Without this, while a setting is being
          * actively adjusted (e.g. dragging the Horizontal/Vertical Trim slider --
@@ -1039,65 +972,40 @@ static void do_analysis(struct dynamic_autocrop_filter *f,
          * eventual commit applies a stale value from whenever the
          * streak began rather than wherever the slider actually ended
          * up, making the crop visibly lag behind the live setting. */
-        f->px0 = nx0; f->py0 = ny0;
-        f->px1 = nx1; f->py1 = ny1;
+        f->pending_x0 = nx0; f->pending_y0 = ny0;
+        f->pending_x1 = nx1; f->pending_y1 = ny1;
     } else {
         /* New candidate -- restart countdown */
-        f->px0 = nx0; f->py0 = ny0;
-        f->px1 = nx1; f->py1 = ny1;
-        f->stable_count = 1;
+        f->pending_x0 = nx0; f->pending_y0 = ny0;
+        f->pending_x1 = nx1; f->pending_y1 = ny1;
+        f->debounce_count = 1;
     }
 
-    blog(LOG_INFO,
-         "[dynamic-autocrop] debounce: candidate=(%.4f,%.4f)-(%.4f,%.4f) stable_count=%d/%d fast_recheck=%s",
-         f->px0, f->py0, f->px1, f->py1, f->stable_count, f->debounce_needed,
-         f->fast_recheck ? "on" : "off");
-
-    if (f->stable_count >= f->debounce_needed) {
-        /* -- Ignore Small Changes --
-         * Debounce above already confirmed this candidate is stable
-         * (matches itself across consecutive readings) -- but that says
-         * nothing about whether it's actually DIFFERENT from what's
-         * already committed. Two consecutive noisy readings can easily
-         * agree with each other at a position that's still only noise
-         * relative to the current crop. This is a second, independent
-         * comparison: against the CURRENTLY COMMITTED boundary, not
-         * against itself. */
-        if (f->limit_small_changes &&
-            crops_match(f->px0, f->py0, f->px1, f->py1,
-                        f->cx0, f->cy0, f->cx1, f->cy1, f->min_change_pct)) {
+    if (f->debounce_count >= f->debounce_needed) {
+        /* Debounce confirmed the candidate is stable across consecutive
+         * readings. Final check: is it actually different enough from the
+         * committed crop to be worth applying? (The early-exit above
+         * handles the common case; this catches candidates that started
+         * larger but settled within threshold by the time debounce ran.) */
+        if (f->skip_minor_updates &&
+            crops_match(f->pending_x0, f->pending_y0, f->pending_x1, f->pending_y1,
+                        f->crop_x0, f->crop_y0, f->crop_x1, f->crop_y1, f->min_update_size)) {
             /* Below threshold on every edge -- treat as noise, keep the
-             * committed crop exactly as it is. Still resolve this
-             * cycle's bookkeeping normally (reset stable_count,
-             * fast_recheck, secs_since_commit) so repeatedly-ignored
-             * noise-sized changes don't make the stall-timeout safety
-             * valve think detection is genuinely stuck and force one
-             * through regardless. */
-            f->stable_count      = 0;
-            f->fast_recheck       = false;
-            f->secs_since_commit = 0.f;
+             * committed crop exactly as it is. */
+            f->debounce_count      = 0;
+            f->fast_recheck      = false;
 
-            blog(LOG_INFO,
-                 "[dynamic-autocrop] Confirmed change too small (< %.2f%%), ignoring -- "
-                 "kept L=%.4f T=%.4f R=%.4f B=%.4f",
-                 f->min_change_pct * 100.0f, f->cx0, f->cy0, f->cx1, f->cy1);
             return;
         }
 
-        f->cx0 = f->px0; f->cy0 = f->py0;
-        f->cx1 = f->px1; f->cy1 = f->py1;
-        f->stable_count      = 0;
-        f->fast_recheck       = false; /* confirmed -- back to normal cadence */
-        f->secs_since_commit = 0.f;
+        f->crop_x0 = f->pending_x0; f->crop_y0 = f->pending_y0;
+        f->crop_x1 = f->pending_x1; f->crop_y1 = f->pending_y1;
+        f->debounce_count      = 0;
+        f->fast_recheck      = false;
+        f->crop_valid    = true;
+        blog(LOG_INFO, "[dynamic-autocrop] Crop updated  L=%.4f T=%.4f R=%.4f B=%.4f",
+             f->crop_x0, f->crop_y0, f->crop_x1, f->crop_y1);
 
-        blog(LOG_INFO,
-             "[dynamic-autocrop] Crop updated  L=%.4f T=%.4f R=%.4f B=%.4f",
-             f->cx0, f->cy0, f->cx1, f->cy1);
-    } else {
-        /* Didn't commit this pass -- secs_since_commit accrues real
-         * elapsed time in filter_tick instead of being approximated
-         * here, since during fast_recheck this can be called many
-         * times per second rather than once per Recalc Interval. */
     }
 }
 
@@ -1117,18 +1025,20 @@ static void filter_get_defaults(obs_data_t *settings)
     obs_data_set_default_int   (settings, S_OUT_W,         0);    /* 0 = auto, match canvas */
     obs_data_set_default_int   (settings, S_OUT_H,         0);    /* 0 = auto, match canvas */
     obs_data_set_default_int   (settings, S_SCALE_FILTER,  SCALE_MODE_LANCZOS);
-    obs_data_set_default_int   (settings, S_BLACK_THRESH,  50);   /* ~20 % luma */
-    obs_data_set_default_double(settings, S_TRIM_X,        0.5);  /* 0.5 %   */
-    obs_data_set_default_double(settings, S_TRIM_Y,        0.5);  /* 0.5 %   */
-    obs_data_set_default_double(settings, S_RECALC_SECS,   1.0);  /* 1 s     */
-    obs_data_set_default_double(settings, S_MIN_BRIGHT,    15.0); /* 15 %    */
-    obs_data_set_default_double(settings, S_MAX_BLACK_PCT, 60.0); /* 60 %    */
-    obs_data_set_default_int   (settings, S_DEBOUNCE,      4);    /* 4 passes */
+    obs_data_set_default_int   (settings, S_BLACK_THRESH,  45);
+    obs_data_set_default_double(settings, S_TRIM_X,        0.4);
+    obs_data_set_default_double(settings, S_TRIM_Y,        0.4);
+    obs_data_set_default_double(settings, S_RECALC_SECS,   1.0);
+    obs_data_set_default_double(settings, S_MAX_DARKNESS,  6.0);
+    obs_data_set_default_int   (settings, S_DEFAULT_CROP,  DEFAULT_CROP_NONE);
+    obs_data_set_default_int   (settings, S_EDGE_SAMPLE_Y, 12);
+    obs_data_set_default_int   (settings, S_EDGE_SAMPLE_X, 20);
+    obs_data_set_default_int   (settings, S_DEBOUNCE,      4);
     obs_data_set_default_bool  (settings, S_FREEZE_CROP,   false);
-    obs_data_set_default_double(settings, S_MAX_CROP_X,    60.0); /* 60 %    */
-    obs_data_set_default_double(settings, S_MAX_CROP_Y,    20.0); /* 20 %    */
+    obs_data_set_default_int   (settings, S_MAX_CROP_X,    60);
+    obs_data_set_default_int   (settings, S_MAX_CROP_Y,    30);
     obs_data_set_default_bool  (settings, S_LIMIT_SMALL_CHANGES, true);
-    obs_data_set_default_double(settings, S_MIN_CHANGE_PCT,      3.0);  /* 3 %     */
+    obs_data_set_default_double(settings, S_MIN_CHANGE_PCT,      3.0);
 }
 
 /* -- Update (settings changed) -- */
@@ -1136,25 +1046,58 @@ static void filter_update(void *data, obs_data_t *settings)
 {
     struct dynamic_autocrop_filter *f = data;
 
+    int  prev_default_crop = f->default_crop;
     f->out_w_setting  = (uint32_t)obs_data_get_int(settings, S_OUT_W);
     f->out_h_setting  = (uint32_t)obs_data_get_int(settings, S_OUT_H);
     f->scale_mode     = (int)     obs_data_get_int(settings, S_SCALE_FILTER);
     f->black_thresh   = (int)     obs_data_get_int(settings, S_BLACK_THRESH);
     f->trim_x         = (float)obs_data_get_double(settings, S_TRIM_X) / 100.f;
     f->trim_y         = (float)obs_data_get_double(settings, S_TRIM_Y) / 100.f;
-    f->recalc_secs    = (float)obs_data_get_double(settings, S_RECALC_SECS);
-    f->min_brightness = (float)obs_data_get_double(settings, S_MIN_BRIGHT)   / 100.f;
-    f->max_black_pct  = (float)obs_data_get_double(settings, S_MAX_BLACK_PCT)/ 100.f;
+    f->scan_interval    = (float)obs_data_get_double(settings, S_RECALC_SECS);
+    f->max_darkness     = (float)obs_data_get_double(settings, S_MAX_DARKNESS)  / 100.f;
+    f->edge_sample_y    = (float)obs_data_get_int(settings, S_EDGE_SAMPLE_Y) / 100.f;
+    f->edge_sample_x    = (float)obs_data_get_int(settings, S_EDGE_SAMPLE_X) / 100.f;
+    f->default_crop      = (int)obs_data_get_int(settings, S_DEFAULT_CROP);
     f->debounce_needed= (int)     obs_data_get_int(settings, S_DEBOUNCE);
     f->freeze_crop    = obs_data_get_bool(settings, S_FREEZE_CROP);
-    f->max_crop_x     = (float)obs_data_get_double(settings, S_MAX_CROP_X) / 100.f;
-    f->max_crop_y     = (float)obs_data_get_double(settings, S_MAX_CROP_Y) / 100.f;
-    f->limit_small_changes = obs_data_get_bool(settings, S_LIMIT_SMALL_CHANGES);
-    f->min_change_pct      = (float)obs_data_get_double(settings, S_MIN_CHANGE_PCT) / 100.f;
+    f->max_crop_x     = (float)obs_data_get_int(settings, S_MAX_CROP_X) / 100.f;
+    f->max_crop_y     = (float)obs_data_get_int(settings, S_MAX_CROP_Y) / 100.f;
+    f->skip_minor_updates = obs_data_get_bool(settings, S_LIMIT_SMALL_CHANGES);
+    f->min_update_size      = (float)obs_data_get_double(settings, S_MIN_CHANGE_PCT) / 100.f;
 
     /* Clamp recalc to a sane minimum to avoid GPU hammering */
-    if (f->recalc_secs < 0.5f)
-        f->recalc_secs = 0.5f;
+    if (f->scan_interval < 0.5f)
+        f->scan_interval = 0.5f;
+
+    /* Threading note: the three volatile flags (force_crop, needs_analysis,
+     * fast_recheck) are the only fields written here that are also read on
+     * the video thread mid-frame. All other settings fields above are only
+     * read by filter_tick / filter_render at the START of a new frame, after
+     * OBS has serialized the update callback -- OBS guarantees filter_update
+     * completes before the next video frame begins, so no mutex is needed
+     * for those fields. The volatile flags are the exception because they
+     * can be set asynchronously from button callbacks at any time. */
+
+    /* If the user changed the Default Crop dropdown, immediately apply it
+     * and commit -- bypass all gates, debounce, and dark-frame checks.
+     * We need src dimensions for this; get them from the filter target. */
+    if (f->default_crop != prev_default_crop) {
+        obs_source_t *target = obs_filter_get_target(f->context);
+        uint32_t sw = target ? obs_source_get_base_width(target)  : 0;
+        uint32_t sh = target ? obs_source_get_base_height(target) : 0;
+        if (sw > 0 && sh > 0) {
+            float dc0, dy0, dc1, dy1;
+            get_default_crop(f->default_crop, sw, sh, &dc0, &dy0, &dc1, &dy1);
+            f->crop_x0 = dc0; f->crop_y0 = dy0;
+            f->crop_x1 = dc1; f->crop_y1 = dy1;
+            f->pending_x0 = dc0; f->pending_y0 = dy0;
+            f->pending_x1 = dc1; f->pending_y1 = dy1;
+            f->crop_valid    = true;
+            f->debounce_count      = 0;
+            blog(LOG_INFO, "[dynamic-autocrop] Default crop changed -- committed L=%.4f T=%.4f R=%.4f B=%.4f",
+                 f->crop_x0, f->crop_y0, f->crop_x1, f->crop_y1);
+        }
+    }
 
     /* Trigger a fresh, fast-tracked analysis so setting changes take
      * effect quickly -- but not while frozen, since freezing
@@ -1165,37 +1108,25 @@ static void filter_update(void *data, obs_data_t *settings)
      * requirement, so a single noisy reading still can't commit on its
      * own. */
     if (!f->freeze_crop) {
-        f->needs_analysis       = true;
-        f->fast_recheck         = true;
-        f->fast_recheck_elapsed = 0.f;
+        os_atomic_store_bool(&f->fast_recheck,   true);
+        os_atomic_store_bool(&f->needs_analysis, true);
     }
 }
 
-/* -- Recalculate Crop Now button (visible only while Freeze Crop is on) -- */
+/* -- Force Crop Now button -- bypasses darkness gates on the next pass -- */
 static bool filter_recalc_button_clicked(obs_properties_t *props, obs_property_t *property, void *data)
 {
     UNUSED_PARAMETER(props);
     UNUSED_PARAMETER(property);
     struct dynamic_autocrop_filter *f = data;
-    f->needs_analysis       = true;
-    f->fast_recheck         = true;
-    f->fast_recheck_elapsed = 0.f;
-    return false; /* no property layout change needed */
-}
-
-/* -- Toggle Recalculate button visibility live as Freeze Crop is checked/unchecked -- */
-static bool filter_freeze_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
-{
-    UNUSED_PARAMETER(property);
-    bool frozen = obs_data_get_bool(settings, S_FREEZE_CROP);
-    obs_property_t *btn = obs_properties_get(props, S_RECALC_BUTTON);
-    if (btn)
-        obs_property_set_visible(btn, frozen);
-    return true;
+    os_atomic_store_bool(&f->fast_recheck,   true);
+    os_atomic_store_bool(&f->needs_analysis, true);
+    os_atomic_store_bool(&f->force_crop,     true);
+    return false;
 }
 
 /* -- Toggle Min Change % slider visibility live as Ignore Small Changes is checked/unchecked -- */
-static bool filter_limit_small_changes_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
+static bool filter_skip_minor_updates_modified(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
     UNUSED_PARAMETER(property);
     bool enabled = obs_data_get_bool(settings, S_LIMIT_SMALL_CHANGES);
@@ -1212,28 +1143,29 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
     f->context = source;
 
     /* Sane "no-op" crop defaults */
-    f->cx0 = 0.f; f->cy0 = 0.f;
-    f->cx1 = 1.f; f->cy1 = 1.f;
-    f->px0 = 0.f; f->py0 = 0.f;
-    f->px1 = 1.f; f->py1 = 1.f;
+    f->crop_x0 = 0.f; f->crop_y0 = 0.f;
+    f->crop_x1 = 1.f; f->crop_y1 = 1.f;
+    f->pending_x0 = 0.f; f->pending_y0 = 0.f;
+    f->pending_x1 = 1.f; f->pending_y1 = 1.f;
 
-    f->committed_once = false;
-    f->first_run       = true;
+    f->crop_valid = false;
+
+    f->needs_initial_scan       = true;
     f->needs_analysis   = false;
     f->elapsed          = 0.f;
-    f->stable_count      = 0;
-    f->prev_src_w        = 0;
-    f->prev_src_h        = 0;
+    f->debounce_count      = 0;
+    f->last_src_w        = 0;
+    f->last_src_h        = 0;
 
     /* Debounced stable-output-size tracking starts empty; filter_tick
      * populates it from the live source over the next few ticks. See
      * the struct field comments and filter_tick for the settle-time
      * logic this uses. */
-    f->stable_out_w = 0;
-    f->stable_out_h = 0;
+    f->adopted_out_w = 0;
+    f->adopted_out_h = 0;
     f->candidate_w  = 0;
     f->candidate_h  = 0;
-    f->settle_timer = 0.f;
+    f->candidate_secs = 0.f;
 
     /* Create GPU resources inside graphics context */
     obs_enter_graphics();
@@ -1281,7 +1213,7 @@ static void filter_tick(void *data, float t)
 
     /* -- Debounced stable-resolution tracking for auto (0) output sizing --
      * Only matters when Output Width or Height is 0 (auto); runs every
-     * tick regardless of first_run/freeze state, since it's about
+     * tick regardless of needs_initial_scan/freeze state, since it's about
      * output SIZE, not crop analysis.
      *
      * Targets the OBS CANVAS resolution (base_width/base_height), not
@@ -1323,15 +1255,15 @@ static void filter_tick(void *data, float t)
             if (live_w != f->candidate_w || live_h != f->candidate_h) {
                 f->candidate_w  = live_w;
                 f->candidate_h  = live_h;
-                f->settle_timer = 0.f;
+                f->candidate_secs = 0.f;
             } else {
-                f->settle_timer += t;
+                f->candidate_secs += t;
             }
 
-            bool no_stable_yet = (f->stable_out_w == 0 || f->stable_out_h == 0);
-            if (no_stable_yet || f->settle_timer >= OUTPUT_SIZE_SETTLE_SECONDS) {
-                f->stable_out_w = f->candidate_w;
-                f->stable_out_h = f->candidate_h;
+            bool no_stable_yet = (f->adopted_out_w == 0 || f->adopted_out_h == 0);
+            if (no_stable_yet || f->candidate_secs >= OUTPUT_SIZE_SETTLE_SECONDS) {
+                f->adopted_out_w = f->candidate_w;
+                f->adopted_out_h = f->candidate_h;
             }
         }
     }
@@ -1340,31 +1272,25 @@ static void filter_tick(void *data, float t)
      * if Freeze Crop is on, since freezing is about holding a crop once
      * we HAVE one -- a brand new filter still needs an initial detection
      * rather than sitting uncropped forever. */
-    if (f->first_run) {
-        f->first_run      = false;
+    if (f->needs_initial_scan) {
+        f->needs_initial_scan      = false;
         f->needs_analysis = true;
         return;
     }
 
     /* While frozen, the periodic timer is suppressed entirely -- the
-     * committed crop just holds. The "Recalculate Crop Now" button
-     * (visible only while Freeze Crop is checked) is the only thing
-     * that can trigger another analysis pass. */
+     * committed crop just holds. Force Crop Now is the only thing
+     * that can trigger another analysis pass while frozen. */
     if (f->freeze_crop)
         return;
 
-    /* Real elapsed time since the last successful commit, for the
-     * stall-timeout safety valve in do_analysis. Only accrues while
-     * not frozen, since no analysis runs during a freeze -- nothing
-     * can be "stalled" if nothing is being attempted. Reset to 0
-     * wherever an actual commit happens. Tracked here (real per-tick
+    /* Real elapsed time accumulates while not frozen -- reset wherever
+     * a commit happens in do_analysis. Tracked here (real per-tick
      * delta time) rather than approximated per analysis call, since
-     * fast_recheck below can make do_analysis run many times per
-     * second rather than once per Recalc Interval. */
-    f->secs_since_commit += t;
+     * fast_recheck can make do_analysis run many times per second. */
 
     if (f->fast_recheck) {
-        /* A settings change, the Recalculate button, or the first
+        /* A settings change, the Force Crop Now button, or the first
          * reading after a dark/black gap is pending fast confirmation
          * -- re-trigger analysis at FAST_RECHECK_INTERVAL_SECS instead
          * of waiting for the normal timer, so debounce's multi-sample
@@ -1384,7 +1310,7 @@ static void filter_tick(void *data, float t)
     }
 
     f->elapsed += t;
-    if (f->elapsed >= f->recalc_secs) {
+    if (f->elapsed >= f->scan_interval) {
         f->elapsed        = 0.f;
         f->needs_analysis = true;
     }
@@ -1406,7 +1332,7 @@ static uint32_t filter_get_width(void *data)
     struct dynamic_autocrop_filter *f = data;
     if (f->out_w_setting != 0)
         return f->out_w_setting;
-    return f->stable_out_w;
+    return f->adopted_out_w;
 }
 
 static uint32_t filter_get_height(void *data)
@@ -1414,7 +1340,7 @@ static uint32_t filter_get_height(void *data)
     struct dynamic_autocrop_filter *f = data;
     if (f->out_h_setting != 0)
         return f->out_h_setting;
-    return f->stable_out_h;
+    return f->adopted_out_h;
 }
 
 /* -- Render -- */
@@ -1436,16 +1362,17 @@ static void filter_render(void *data, gs_effect_t *effect)
         return;
     }
 
-    /* If the source resolution changed, reset to full-frame crop and
+    /* If the source resolution changed, reset to default crop position and
      * force a fresh analysis on the new resolution. */
-    if (src_w != f->prev_src_w || src_h != f->prev_src_h) {
-        f->cx0 = 0.f; f->cy0 = 0.f;
-        f->cx1 = 1.f; f->cy1 = 1.f;
-        f->stable_count    = 0;
-        f->committed_once  = false;
-        f->needs_analysis  = true;
-        f->prev_src_w      = src_w;
-        f->prev_src_h      = src_h;
+    if (src_w != f->last_src_w || src_h != f->last_src_h) {
+        get_default_crop(f->default_crop, src_w, src_h,
+                         &f->crop_x0, &f->crop_y0, &f->crop_x1, &f->crop_y1);
+        f->debounce_count   = 0;
+        f->crop_valid = false;
+        f->needs_analysis = true;
+        f->last_src_w     = src_w;
+        f->last_src_h     = src_h;
+        blog(LOG_INFO, "[dynamic-autocrop] Resolution changed to %ux%u -- resetting", src_w, src_h);
     }
 
     /* -- Analysis pass (rate-limited) -- */
@@ -1461,8 +1388,8 @@ static void filter_render(void *data, gs_effect_t *effect)
      * drawn). Falls back to the immediate live src_w/h only in the rare
      * case this runs before filter_tick has established a stable value
      * yet, so the very first frame never renders at 0x0. */
-    uint32_t out_w = (f->out_w_setting != 0) ? f->out_w_setting : (f->stable_out_w ? f->stable_out_w : src_w);
-    uint32_t out_h = (f->out_h_setting != 0) ? f->out_h_setting : (f->stable_out_h ? f->stable_out_h : src_h);
+    uint32_t out_w = (f->out_w_setting != 0) ? f->out_w_setting : (f->adopted_out_w ? f->adopted_out_w : src_w);
+    uint32_t out_h = (f->out_h_setting != 0) ? f->out_h_setting : (f->adopted_out_h ? f->adopted_out_h : src_h);
 
     /* -- Output render --
      * obs_source_process_filter_begin renders all filters below us in the
@@ -1479,19 +1406,19 @@ static void filter_render(void *data, gs_effect_t *effect)
     }
 
     /* -- Crop post-processing, re-applied here independently of analysis --
-     * f->cx0..f->cy1 hold the RAW debounce-confirmed detected boundary
+     * f->crop_x0..f->crop_y1 hold the RAW debounce-confirmed detected boundary
      * only -- Horizontal/Vertical Trim and Max Crop X/Y are applied
      * fresh, every single render frame, directly against whatever the
      * CURRENT settings are. This is what guarantees Horizontal/Vertical
      * Trim and Max Crop X/Y always take effect the instant they're
      * changed, with zero dependency on whether a new raw detection has
-     * happened to run -- which Min Brightness / Max Black % gating, or
+     * happened to run -- which Max Darkness % gating, or
      * simply Recalc Interval's pacing, could otherwise delay
-     * indefinitely. f->cx0..f->cy1 themselves stay untouched here, since
+     * indefinitely. f->crop_x0..f->crop_y1 themselves stay untouched here, since
      * debounce in do_analysis needs that genuine raw detection history
      * to compare fresh readings against. */
     float rx0, ry0, rx1, ry1;
-    apply_crop_postprocessing(f, f->cx0, f->cy0, f->cx1, f->cy1, src_w, src_h, false,
+    apply_crop_postprocessing(f, f->crop_x0, f->crop_y0, f->crop_x1, f->crop_y1, src_w, src_h,
                                &rx0, &ry0, &rx1, &ry1);
 
     struct vec2 uv_off = { rx0,       ry0       };
@@ -1516,7 +1443,7 @@ static void filter_render(void *data, gs_effect_t *effect)
  * ============================================================================= */
 static obs_properties_t *filter_properties(void *data)
 {
-    struct dynamic_autocrop_filter *f = data;
+    struct dynamic_autocrop_filter *f = data; /* may be NULL if called before create */
     obs_properties_t *props = obs_properties_create();
 
     obs_property_t *p;
@@ -1535,8 +1462,25 @@ static obs_properties_t *filter_properties(void *data)
     obs_property_list_add_int(sf, "Sharp Bilinear (Retro)",     SCALE_MODE_SHARP_BILINEAR);
     obs_property_list_add_int(sf, "Lanczos (Highest Quality, Heaviest)", SCALE_MODE_LANCZOS);
 
-    p = obs_properties_add_int_slider(props, S_BLACK_THRESH, "Black Threshold", 0, 64, 1);
-    obs_property_set_long_description(p, "How dark a pixel must be to count as border. Raise for noisy/composite captures.\nOnly affects border detection -- the Max Black % gate below uses its own fixed definition, independent of this.");
+    obs_property_t *dc = obs_properties_add_list(props, S_DEFAULT_CROP,
+        "Default Crop",
+        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(dc, "None (full frame)",      DEFAULT_CROP_NONE);
+    obs_property_list_add_int(dc, "4:3 (remove pillarbox)", DEFAULT_CROP_4_3);
+    obs_property_list_add_int(dc, "16:9 (remove letterbox)", DEFAULT_CROP_16_9);
+    obs_property_set_long_description(dc,
+        "Starting crop position used when detection resets.\n"
+        "4:3: centers a 4:3 region at full height -- removes pillarboxes on a 16:9 source.\n"
+        "16:9: centers a 16:9 region at full width -- removes letterboxes on a 4:3 source.\n"
+        "If the source already matches the selected ratio, no pre-crop is applied.");
+
+    p = obs_properties_add_int_slider(props, S_BLACK_THRESH, "Black Threshold", 0, 128, 1);
+    obs_property_set_long_description(p,
+        "Per-pixel brightness cutoff for border detection. A pixel where max(R,G,B) is at or "
+        "below this value is treated as black border; above it counts as content.\n"
+        "0 = only pure black is border. 45 (default) = anything darker than ~18% brightness. "
+        "128 = anything darker than 50% brightness.\n"
+        "Raise for noisy or composite captures where the border isn't perfectly black.");
 
     p = obs_properties_add_float_slider(props, S_TRIM_X, "Horizontal Trim %", 0.0, 10.0, 0.1);
     obs_property_set_long_description(p, "Extra inward trim from the left and right edges, beyond the detected border.\nUse for stray garbage pixels just outside the picture (e.g. Mega Drive/Genesis dots).\nDefaults to a small non-zero value to prevent a thin border sliver -- lowering it toward 0% trades that protection away.");
@@ -1544,39 +1488,53 @@ static obs_properties_t *filter_properties(void *data)
     p = obs_properties_add_float_slider(props, S_TRIM_Y, "Vertical Trim %", 0.0, 10.0, 0.1);
     obs_property_set_long_description(p, "Extra inward trim from the top and bottom edges, beyond the detected border.\nUse for stray garbage pixels just outside the picture.\nDefaults to a small non-zero value to prevent a thin border sliver -- lowering it toward 0% trades that protection away.");
 
-    p = obs_properties_add_float_slider(props, S_RECALC_SECS, "Recalc Interval (s)", 0.5, 30.0, 0.5);
-    obs_property_set_long_description(p, "How often (seconds) to re-scan for the border.");
-
-    p = obs_properties_add_float_slider(props, S_MIN_BRIGHT, "Min Brightness %", 0.0, 50.0, 0.5);
-    obs_property_set_long_description(p, "Skip re-scanning frames darker than this\n(average brightness across the whole frame).");
-
-    p = obs_properties_add_float_slider(props, S_MAX_BLACK_PCT, "Max Black %", 0.0, 100.0, 1.0);
-    obs_property_set_long_description(p, "Skip re-scanning if more of the frame than this is near-black.\nCatches dark scenes with a bright HUD that Min Brightness alone would miss.");
-
-    p = obs_properties_add_int_slider(props, S_DEBOUNCE, "Debounce", 1, 6, 1);
-    obs_property_set_long_description(p, "Stable samples required before applying a CHANGED crop.");
-
-    p = obs_properties_add_float_slider(props, S_MAX_CROP_X, "Max Crop X %", 0.0, 90.0, 1.0);
+    p = obs_properties_add_int_slider(props, S_MAX_CROP_X, "Max Crop X %", 0, 90, 1);
     obs_property_set_long_description(p, "Never crop away more than this much of the frame's WIDTH, even if detection finds more.\nProtects genuine in-game black bars (e.g. TATE-mode vertical shooters like Ikaruga, played pillarboxed) from being over-cropped.");
 
-    p = obs_properties_add_float_slider(props, S_MAX_CROP_Y, "Max Crop Y %", 0.0, 90.0, 1.0);
+    p = obs_properties_add_int_slider(props, S_MAX_CROP_Y, "Max Crop Y %", 0, 90, 1);
     obs_property_set_long_description(p, "Never crop away more than this much of the frame's HEIGHT, even if detection finds more.\nProtects genuine in-game black bars (e.g. title screens like Metroid Prime) from being over-cropped.");
 
-    p = obs_properties_add_bool(props, S_LIMIT_SMALL_CHANGES, "Ignore Small Changes");
-    obs_property_set_long_description(p, "Skip applying a new crop if it's only marginally different from the current one -- helps avoid tiny adjustments caused by analog noise.");
-    obs_property_set_modified_callback(p, filter_limit_small_changes_modified);
+    p = obs_properties_add_float_slider(props, S_RECALC_SECS, "Scan Interval (s)", 0.5, 10.0, 0.5);
+    obs_property_set_long_description(p, "How often (seconds) to re-scan for the border.");
 
-    p = obs_properties_add_float_slider(props, S_MIN_CHANGE_PCT, "Min Change %", 0.1, 5.0, 0.1);
+    p = obs_properties_add_float_slider(props, S_MAX_DARKNESS,
+        "Max Darkness %", 0.0, 50.0, 0.5);
+    obs_property_set_long_description(p,
+        "Each edge's sampling zone must have an average luma (of all non-pure-black pixels) "
+        "at or above this value to update that edge.\n"
+        "Pure-black pixels (0x000000 and 0x010101 hardware border) are excluded from "
+        "the calculation entirely -- only actual content and noise are measured.\n"
+        "Lower = more permissive (allows darker zones through). "
+        "Raise to hold the crop during dark scenes like loading screens or fade-outs.");
+
+    p = obs_properties_add_int_slider(props, S_EDGE_SAMPLE_Y,
+        "Edge Sampling Region Y %", 5, 50, 1);
+    obs_property_set_long_description(p,
+        "How far in from the top and bottom edges the brightness gate samples.\n"
+        "Raise if your source has deep borders that keep the top/bottom zones gated.");
+
+    p = obs_properties_add_int_slider(props, S_EDGE_SAMPLE_X,
+        "Edge Sampling Region X %", 5, 50, 1);
+    obs_property_set_long_description(p,
+        "How far in from the left and right edges the brightness gate samples.\n"
+        "Raise if your source has wide borders that keep the left/right zones gated.");
+
+    p = obs_properties_add_int_slider(props, S_DEBOUNCE, "Debounce", 1, 10, 1);
+    obs_property_set_long_description(p, "Stable samples required before applying a CHANGED crop.");
+
+    p = obs_properties_add_bool(props, S_LIMIT_SMALL_CHANGES, "Skip Minor Updates");
+    obs_property_set_long_description(p, "Skip applying a new crop if it's only marginally different from the current one -- helps avoid tiny adjustments caused by analog noise.");
+    obs_property_set_modified_callback(p, filter_skip_minor_updates_modified);
+
+    p = obs_properties_add_float_slider(props, S_MIN_CHANGE_PCT, "Minimum Update Size %", 0.1, 5.0, 0.1);
     obs_property_set_long_description(p, "How different (per edge) a new crop must be from the current one before it's treated as a real change rather than noise.");
-    obs_property_set_visible(p, f ? f->limit_small_changes : false);
+    obs_property_set_visible(p, f ? f->skip_minor_updates : false);
 
     p = obs_properties_add_bool(props, S_FREEZE_CROP, "Freeze Crop");
     obs_property_set_long_description(p, "Stop re-scanning and hold the current crop exactly as-is.\nUseful as a workaround for games that otherwise confuse detection.");
-    obs_property_set_modified_callback(p, filter_freeze_modified);
 
-    obs_property_t *btn = obs_properties_add_button(props, S_RECALC_BUTTON,
-        "Recalculate Crop Now", filter_recalc_button_clicked);
-    obs_property_set_visible(btn, f ? f->freeze_crop : false);
+    obs_properties_add_button(props, S_RECALC_BUTTON,
+        "Force Crop Now", filter_recalc_button_clicked);
 
     return props;
 }

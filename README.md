@@ -1,49 +1,62 @@
 # Dynamic Autocrop
 
-An OBS Studio plugin that crops the black (or near-black) border produced by retro upscalers and line-doublers (RetroTink, OSSC, Morph, and similar devices) running in a fixed-canvas "scale under" style mode, then stretches the active picture to fill a configured output resolution -- all in real time, automatically.
+An OBS Studio plugin that automatically detects and crops the black border produced by retro upscalers (RetroTink, OSSC, Morph, and similar devices) running in a fixed-canvas "scale under" mode, then stretches the active picture to fill your configured output resolution in real time.
+
+**Tested on:** PlayStation 2 (v1.1), GameCube (v1.0) via RetroTink 5X Pro.
 
 ## The problem it fixes
 
-Many retro upscalers and line-doublers, when set to output a fixed-size canvas rather than the console's native resolution (RetroTink calls this mode "Scale: Under"; other devices use their own names for the same idea), produce a fixed canvas (e.g. 1920x1080) with the actual active picture sitting somewhere inside it, surrounded by a black border whose size depends on the source resolution being scaled. That border size isn't constant -- different consoles, and even different games on the same console, can produce different border thicknesses. OBS's own Crop/Pad filter can crop a fixed number of pixels, but can't adapt automatically when the border changes. This plugin detects the actual border on every frame and crops to it dynamically, so switching games or consoles doesn't require manually re-measuring and re-entering crop values.
+Retro upscalers and line-doublers output a fixed canvas resolution — e.g. 1920×1080 — with the actual game picture sitting inside it, surrounded by a black border. This happens any time the source resolution doesn't fill the output canvas: RetroTink's "Scale: Under" mode, OSSC's line-doubling output at lower resolutions, or any manual crop setup where the picture doesn't fill the frame. The border size varies by console, by game, and by scaler settings. OBS's built-in Crop/Pad filter crops a fixed pixel count and can't adapt when it changes. This plugin detects the real border each scan and crops to it dynamically.
 
 ## How it works
 
 ### Detection
 
-The filter periodically renders the source into a small 1280x720 texture (16:9, matching the canvas most capture/scaler setups actually deliver, so detection precision is balanced across both axes rather than skewed toward one) and reads the pixels back to the CPU:
+Every scan interval, the filter renders the source into a small 640×360 staging buffer and reads it back to the CPU:
 
-1. **Brightness / Max Black % gates** -- skip the pass entirely if the frame is too dark or too uniformly black to give a trustworthy reading (loading screens, boot logos, fades).
-2. **Per-row/column content scan** -- a row or column only counts as "content" once a meaningful fraction of its pixels exceed Black Threshold, not just a single stray pixel, so an isolated noise spike or hot pixel can't fool detection on its own.
+1. **Per-edge zone gating** — each edge (top, bottom, left, right) has its own sampling zone, set by Edge Sampling Region X/Y %. The average luma of non-pure-black pixels in that zone must meet or exceed Max Darkness % for analysis to proceed. All four zones must pass simultaneously — if any zone is gated, the scan is held and the current crop stays. This prevents loading screens, fades, and dark scenes from triggering a false crop update.
 
-Horizontal/Vertical Trim and Max Crop X/Y aren't part of detection itself -- they're applied afterward, every frame, regardless of how often detection runs.
+2. **Per-row/column content scan** — scans inward from each edge. A row or column counts as content once a meaningful fraction of its pixels exceed Black Threshold, so a single noise spike or hot pixel can't trigger a false border position on its own.
+
+Horizontal/Vertical Trim and Max Crop X/Y are applied at render time only, completely independently of detection. They never affect what the scanner sees or what debounce compares.
+
+### Commit pipeline
+
+A freshly detected crop goes through debounce before applying: it must match the previous scan within 1.5% on all four edges for `Debounce` consecutive passes. This stops a single bad or transitional frame from snapping the picture to a wrong crop.
+
+Two things bypass debounce:
+- **Force Crop Now button** — bypasses both the darkness gate and debounce, committing whatever is detected on the next pass directly. Useful when detection is gated on a dark border you know is stable.
+- **Default Crop dropdown** — when you change the Default Crop setting, that position commits immediately as the active crop. Detection then runs normally from there, tightening inward via debounce as usual.
+
+When gates are open and a new crop is being confirmed, the scan interval drops to 100ms (fast recheck) until debounce settles, then returns to the configured Scan Interval.
+
+If **Skip Minor Updates** is enabled, a confirmed crop is also compared against what's currently showing — if every edge differs by less than Minimum Update Size %, the update is skipped and the current crop holds.
 
 ### Post-processing
 
-Max Crop X/Y and Horizontal/Vertical Trim are both applied fresh on every single rendered frame:
+Applied fresh every rendered frame, independently of detection:
 
-1. **Max Crop X/Y** is enforced first -- a hard ceiling, pulling the crop back outward (expanding from wherever the detected border already sits, not forced to an even split) if detection wants to remove more than the configured limit.
-2. **Horizontal/Vertical Trim** is applied last, independently per axis. Nothing overrides it afterward.
+1. **Max Crop X/Y** — hard ceiling on how much of the frame can be removed per axis. Enforced first, expanding the crop back outward if detection would remove more than the limit.
+2. **Horizontal/Vertical Trim** — inward trim applied last. Nothing overrides it afterward.
 
-Because of this, **Max Crop X/Y and Horizontal/Vertical Trim take effect the instant you change them** -- even while Freeze Crop is on, or while detection itself is paused by Min Brightness / Max Black % on a dark scene.
-
-### Commit
-
-A newly detected crop has to match what was found on the previous scan, within 1.5% on all four edges, for `Debounce` consecutive scans, before it actually applies -- this stops a single bad or transitional frame from snapping the picture to a wrong crop. Two things skip this and apply immediately:
-
-- The very first detection, right after the filter is added or the resolution changes.
-- A 15-second safety timeout: if nothing has applied in 15 real seconds despite repeatedly trying, the next attempt applies regardless, so a noisy or drifting source can't get stuck indefinitely.
-
-Everything else -- changing a setting, pressing Recalculate Crop Now, or the first scan after a dark/black gap -- still goes through that same matching check, just faster: it re-scans every 0.1s instead of waiting for the full Recalc Interval, so it typically settles within a fraction of a second.
-
-If **Ignore Small Changes** is enabled, a newly confirmed crop is also compared against what's currently showing -- if every edge differs by less than Min Change %, it's skipped and the current crop is left exactly as-is, rather than applying a change too small to matter.
+Both take effect instantly when you change them — even while Freeze Crop is on or the gate is holding.
 
 ### Output
 
-The final crop is applied via a GPU shader (whichever Scale Filter is selected), with a tiny built-in safety margin at the pixel level so a thin line of border colour can never bleed into the edge of the picture.
+The final crop is applied via a GPU shader using the selected Scale Filter, with a built-in sub-pixel safety margin so a thin sliver of border can never bleed into the picture edge.
+
+## Per-console setup with Scene Collections
+
+Filter settings are saved per scene collection by OBS automatically. The recommended workflow for multiple consoles:
+
+1. Set up and tune the filter for your first console.
+2. In OBS: **Scene Collection → Duplicate** and name it after the console.
+3. Open the duplicate, retune the filter for the next console.
+4. Switch collections when switching consoles — the filter loads with the correct settings automatically.
 
 ## Verification
 
-Every OBS API used here was checked against the real OBS 31.0.0 source (`obsproject/obs-studio` tag `31.0.0`) rather than assumed -- including a direct symbol-by-symbol cross-check between every shader uniform declared and every uniform looked up on the C side, confirming neither has an orphaned or missing entry. The plugin compiles cleanly against those real headers, and the shader source is verified brace/paren-balanced as part of the same check.
+Every OBS API used here was checked against the real OBS 31.0.0 source (`obsproject/obs-studio` tag `31.0.0`) rather than assumed — including a direct symbol-by-symbol cross-check between every shader uniform declared and every uniform looked up on the C side, confirming neither has an orphaned or missing entry. The plugin compiles cleanly against those real headers, and the shader source is verified brace/paren-balanced as part of the same check.
 
 ## Project layout
 
@@ -55,44 +68,45 @@ obs-dynamic-autocrop/
   src/
     dynamic_autocrop_filter.c -- the filter itself (detection, post-processing, shader)
   data/
-    locale/en-US.ini    -- module display name
+    locale/en-US.ini    -- filter display name shown in OBS (required)
 ```
 
 ## Settings
 
-| Setting | What it does |
-|---|---|
-| **Output Width / Height** | The crop is stretched to fill exactly this resolution. `0` (default) automatically matches your OBS canvas resolution -- recommended, since it lets this filter do the full crop+resize in a single pass instead of OBS having to resize again afterward. Set both explicitly to override. |
-| **Scale Filter** | `Linear` (smooth), `Point` (crisp nearest-neighbour, best at integer scales), `Sharp Bilinear` (nearest-neighbour grid with a thin anti-aliased blend -- common retro-upscaler look), or `Lanczos` (default, highest quality, heaviest -- 36 samples/pixel). |
-| **Black Threshold** | How dark a pixel must be to count as border. Raise it for noisy composite/S-Video captures where "black" isn't truly 0. Default 50. |
-| **Horizontal Trim %** | Extra inward trim from the left and right edges, beyond the detected border. Use for coloured garbage pixels sitting just outside the active picture (Mega Drive/Genesis dots, etc). Defaults to 0.5% rather than 0% -- this is what prevents a thin leftover sliver of border colour at the edge, so lowering it trades that protection away. |
-| **Vertical Trim %** | Same as Horizontal Trim, for the top and bottom edges. Set independently. Defaults to 0.5% for the same reason. |
-| **Recalc Interval (s)** | How often the filter re-scans for borders. Default 1.0s. |
-| **Min Brightness %** | Skip re-scanning frames darker than this (average brightness across the whole frame). Default 15%. |
-| **Max Black %** | Skip re-scanning if more of the frame than this is near-black. Catches dark scenes with a bright HUD that Min Brightness alone would miss. Default 60%. |
-| **Debounce** | Stable samples required before applying a *changed* crop. The very first detection always applies immediately. Default 4. |
-| **Max Crop X / Y %** | Hard ceiling on how much of the frame can be cropped away per axis, regardless of what detection finds. Protects genuine in-game black bars from being mistaken for scaler border and over-cropped -- X protects pillarboxing (e.g. TATE-mode vertical shooters like Ikaruga), Y protects letterboxing (e.g. title screens like Metroid Prime). Default 60% / 20%. |
-| **Ignore Small Changes** | Skip applying a new crop if it's only marginally different from the current one -- helps avoid tiny adjustments caused by analog noise. On by default. |
-| **Min Change %** | Only visible when Ignore Small Changes is on. How different (per edge) a new crop must be before it's treated as real rather than noise. Default 3%. |
-| **Freeze Crop** | Stop re-scanning and hold the current crop exactly as-is. Useful as a workaround for games that otherwise confuse detection. |
-| **Recalculate Crop Now** | Button, visible only while Freeze Crop is on -- forces one fresh re-scan on demand. |
+| Setting | Default | What it does |
+|---|---|---|
+| **Output Width / Height** | 0 (auto) | Resolution the crop is stretched to fill. `0` matches your OBS canvas — recommended, since it lets the filter do crop and resize in one pass. |
+| **Scale Filter** | Lanczos | Resampling quality: Point (nearest-neighbour), Linear, Sharp Bilinear, or Lanczos (highest quality). |
+| **Default Crop** | None | Starting crop position used when detection resets (resolution change or filter added). 4:3 removes pillarbox on a 16:9 source; 16:9 removes letterbox on a 4:3 source. Detection can only tighten from this position, never widen past it. |
+| **Black Threshold** | 45 | Per-pixel brightness cutoff. A pixel where max(R,G,B) ≤ this value is treated as black border; above it counts as content. Raise for noisy composite/S-Video captures where black isn't truly 0. |
+| **Max Crop X %** | 60 | Hard ceiling on how much width detection can remove. Protects intentional pillarboxing (e.g. TATE-mode shooters). |
+| **Max Crop Y %** | 30 | Hard ceiling on how much height detection can remove. Protects intentional letterboxing (e.g. cinematic title screens). |
+| **Scan Interval (s)** | 1.0 | How often the filter re-scans for borders when idle. Drops to 100ms automatically while confirming a new crop. |
+| **Max Darkness %** | 6 | Minimum average luma a zone must have (excluding pure-black pixels) to allow analysis. Raise to hold the crop during darker scenes. |
+| **Edge Sampling Region Y %** | 12 | How far in from top and bottom the zone gate samples. Raise if your source has deep borders keeping those zones gated. |
+| **Edge Sampling Region X %** | 20 | How far in from left and right the zone gate samples. Raise if your source has wide borders keeping those zones gated. |
+| **Debounce** | 4 | Consecutive matching scans required before a changed crop applies. |
+| **Skip Minor Updates** | On | Skip applying a new crop if every edge differs by less than Minimum Update Size % from the current crop. |
+| **Minimum Update Size %** | 3 | Visible when Skip Minor Updates is on. Per-edge threshold below which a confirmed crop is considered noise and discarded. |
+| **Freeze Crop** | Off | Hold the current crop exactly and stop scanning. Post-processing (Trim, Max Crop) still applies every frame. |
+| **Force Crop Now** | — | Button. Bypasses the darkness gate and debounce, committing whatever is detected on the next pass immediately. |
+| **Horizontal Trim %** | 0.4 | Extra inward trim from left and right edges after detection. Useful for garbage pixels at the border edge (e.g. Mega Drive border dots). |
+| **Vertical Trim %** | 0.4 | Same as Horizontal Trim, for top and bottom. |
 
 ## Requirements
 
 - **OBS Studio 28.0** or later
 - **CMake 3.16+**
 - MSVC 2019+ (Visual Studio Build Tools)
-- OBS development headers / CMake config (`libobs`)
+- OBS development headers (`libobs`)
 
-## Installing
-
-### Option A: Build from source
+## Building
 
 ```
 build.bat
 ```
 
-Double-click it, or run it from a shell. It requests admin elevation (via UAC), then: installs Visual Studio Build Tools if missing, downloads OBS development headers and generates an import library from your installed `obs.dll` if needed, configures and builds with CMake, and installs the result straight into your OBS installation. Restart OBS afterwards.
+Double-click or run from a shell. Requests UAC elevation, then: installs Visual Studio Build Tools if missing, downloads OBS development headers, configures and builds with CMake, and installs directly into your OBS installation. Restart OBS afterward.
 
 Manual build:
 ```bat
@@ -103,24 +117,24 @@ cmake --build build --config RelWithDebInfo
 cmake --install build --config RelWithDebInfo --prefix "C:\Program Files\obs-studio"
 ```
 
-### Option B: Manual install (pre-built binary)
+## Installing
 
 | OS | Plugin binary | Data folder |
 |---|---|---|
 | **Windows** | `%ProgramFiles%\obs-studio\obs-plugins\64bit\obs-dynamic-autocrop.dll` | `%ProgramFiles%\obs-studio\data\obs-plugins\obs-dynamic-autocrop\` |
 
-Then restart OBS.
+Restart OBS after installing.
 
-## Adding the filter in OBS
+## Adding the filter
 
-1. Right-click your capture source in the Sources list -> **Filters**
-2. The Filters window has two separate lists: **Audio/Video Filters** and **Effect Filters**. Click the **+** under **Effect Filters** specifically -- this is a render/video-processing filter, not an async source filter, so it won't appear under Audio/Video Filters.
-3. Select **Dynamic Autocrop** from the list, then **Close**
+1. Right-click your capture source in the Sources list → **Filters**
+2. The Filters window has two separate lists: **Audio/Video Filters** and **Effect Filters**. Click the **+** under **Effect Filters** specifically — this is a render/video-processing filter, not an async source filter, so it won't appear under Audio/Video Filters.
+3. Select **Dynamic Autocrop** from the list and adjust settings as needed.
 
 ## License
 
-GPL-2.0 (see `LICENSE`). This links against `libobs`, which is GPL-2.0-or-later -- per OBS's own stated policy, any plugin that links against OBS Studio is required to be GPL-compatible.
+GPL-2.0 (see `LICENSE`). This plugin links against `libobs`, which is GPL-2.0-or-later.
 
 ## AI disclosure
 
-This plugin's source code was written in collaboration with Claude (Anthropic). Every OBS API call it makes was checked against the actual OBS Studio source rather than assumed (see "Verification" above), and the shader/C-side interface was cross-checked symbol-by-symbol rather than shipped without checking it actually lines up.
+This plugin was written in collaboration with Claude (Anthropic). Every OBS API call was verified against the actual OBS Studio 31.0.0 source, and the shader/C interface was cross-checked symbol-by-symbol.
